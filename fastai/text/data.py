@@ -56,19 +56,14 @@ class Numericalize(Transform):
 # %% ../../nbs/31_text.data.ipynb #b27dd16b
 def _maybe_first(o): return o[0] if isinstance(o, tuple) else o
 
-# %% ../../nbs/31_text.data.ipynb #7fd53e96
-def _get_tokenizer(ds):
-    tok = getattr(ds, 'tokenizer', None)
-    if isinstance(tok, Tokenizer): return tok
-    if isinstance(tok, (list,L)):
-        for t in tok:
-            if isinstance(t, Tokenizer): return t
-
 # %% ../../nbs/31_text.data.ipynb #8e71a626
 def _get_lengths(ds):
-    tok = _get_tokenizer(ds)
-    if tok is None: return
-    return tok.get_lengths(ds.items)
+    "Lengths of `ds.items` from a transform with `get_lengths`, if any"
+    f = getattr(ds, 'get_lengths', None)
+    if f is None: return
+    if isinstance(f, L): f = f[0]
+    return f(ds.items)
+
 
 # %% ../../nbs/31_text.data.ipynb #1f66c43d
 #TODO: add backward

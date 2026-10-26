@@ -83,6 +83,7 @@ website:
         contents:
         - 30_text.core.ipynb
         - 31_text.data.ipynb
+        - 36_text.tokenizer.ipynb
         - 37_text.learner.ipynb
         - section: Models
           contents:
