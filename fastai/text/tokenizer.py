@@ -6,7 +6,8 @@ Docs: https://docs.fast.ai/text.tokenizer.html.md"""
 
 # %% auto #0
 __all__ = ['EOS_TOK', 'BOS_TOK', 'PAD_TOK', 'hf_tokenizer', 'save_token_cache', 'load_token_cache', 'id_dtype', 'tokenize_texts',
-           'split_docs', 'tokenize_dataset', 'HfTokenizer', 'Reverse', 'HfTextBlock']
+           'split_docs', 'tokenize_dataset', 'tokenize_folder', 'HfTokenizer', 'Reverse', 'HfTextBlock',
+           'TextDataLoadersNew']
 
 # %% ../../nbs/36_text.tokenizer.ipynb #1f30303f
 from ..torch_basics import *
@@ -49,15 +50,14 @@ def id_dtype(tok):
 def tokenize_texts(
     items, # Texts, or the items `get_texts` extracts them from
     tok, # HF `Tokenizer`
-    get_texts=None, # Function from `items` to its texts
-    text_proc=None, # Function applied to the text collection before encoding, e.g. assembling into documents
-    bs=1024, # Texts per encode call
+    get_texts=None, # Column of texts from Dataset, or function from `items` to the texts
+    bs=1024, 
     cache_dir=None,
 ):
     "Encode texts into flat token IDs and document offsets, where document `i` is `flat[offsets[i]:offsets[i+1]]`"
+    if isinstance(get_texts, str): get_texts = itemgetter(get_texts)
     texts = items if get_texts is None else get_texts(items)
-    if text_proc is not None: texts = text_proc(texts)
-    texts = L(texts)
+    texts = list(texts)
     dtype = id_dtype(tok)
     chunks = [np.asarray(e.ids, dtype=dtype) for i in progress_bar(range(0, len(texts), bs)) for e in tok.encode_batch_fast(texts[i:i+bs])]
     flat = np.concatenate(chunks) if chunks else np.empty(0, dtype=dtype)
@@ -74,23 +74,39 @@ def split_docs(flat, offsets):
 @delegates(tokenize_texts)
 def tokenize_dataset(
     name, # Hugging Face dataset
-    get_texts, # Function from the dataset to its texts
+    get_texts, # Column of the dataset, or function from it to its texts
     subset=None,
     split='train',
-    tok='gpt2', # Tokenizer name for `hf_tokenizer`, or a `Tokenizer`, which then needs `cache_dir`
+    tok='gpt2', # Tokenizer name for `hf_tokenizer`
     cache_dir=None, # Cache directory; `fastai_path('data')/'token_cache'/name/subset/split/tok` if None
     **kwargs
 ):
     "Token cache for a Hugging Face dataset, loaded from `cache_dir` when it exists, otherwise encoded and saved there first"
-    if cache_dir is None:
-        if not isinstance(tok, str): raise ValueError('pass `cache_dir` when `tok` is a `Tokenizer`, since the default path needs its name')
-        cache_dir = fastai_path('data')/'token_cache'/name/(subset or 'default')/split/tok
+    if cache_dir is None: cache_dir = fastai_path('data')/'token_cache'/name/(subset or 'default')/split/tok
     if not (Path(cache_dir)/'tokenizer.json').exists():
         ds = load_dataset(name, subset, split=split)
-        if isinstance(tok, str): tok = hf_tokenizer(tok)
-        tokenize_texts(ds, tok, get_texts=get_texts, cache_dir=cache_dir, **kwargs)
+        tokenize_texts(ds, hf_tokenizer(tok), get_texts=get_texts, cache_dir=cache_dir, **kwargs)
     return load_token_cache(cache_dir)
 
+
+# %% ../../nbs/36_text.tokenizer.ipynb #53a42456
+@delegates(tokenize_texts)
+def tokenize_folder(
+    path, # Folder of text files
+    tok='gpt2', # Tokenizer name for `hf_tokenizer`
+    cache_dir=None, # Cache directory; `fastai_path('data')/'token_cache'/path.name/tok` if None
+    **kwargs
+):
+    "Every text file under `path`, their token cache, and its tokenizer; the cache is built on the first call"
+    path = Path(path)
+    files = get_text_files(path).sorted()
+    if cache_dir is None: cache_dir = fastai_path('data')/'token_cache'/path.name/tok
+    if not (Path(cache_dir)/'tokenizer.json').exists():
+        tokenize_texts(files, hf_tokenizer(tok), get_texts=lambda fs: [f.read_text(encoding='utf-8') for f in fs], cache_dir=cache_dir, **kwargs)
+    flat, offsets, tok = load_token_cache(cache_dir)
+    docs = split_docs(flat, offsets)
+    if len(docs) != len(files): raise ValueError(f'{cache_dir} holds {len(docs)} documents for {len(files)} files: delete it to rebuild')
+    return files, docs, tok
 
 # %% ../../nbs/36_text.tokenizer.ipynb #80b93f00
 class HfTokenizer(Transform):
@@ -123,11 +139,37 @@ class HfTextBlock(TransformBlock):
                          dls_kwargs={'seq_len': seq_len} if is_lm else {'before_batch': Pad_Chunk(seq_len=seq_len, pad_idx=tok_tfm.pad_id)})
 
 # %% ../../nbs/36_text.tokenizer.ipynb #e105258d
-@patch_to(TextDataLoaders, cls_method=True)
-@delegates(tokenize_dataset)
-def from_dataset(cls, name, get_texts, subset=None, valid_pct=0.2, seed=None, seq_len=72, backwards=False, bs=64, **kwargs):
-    "Language model `DataLoaders` from the token cache of a Hugging Face dataset"
-    flat, offsets, tok = tokenize_dataset(name, get_texts, subset, **kwargs)
-    blk = HfTextBlock(HfTokenizer(tok), is_lm=True, seq_len=seq_len, backwards=backwards)
-    dblock = DataBlock(blocks=blk, splitter=RandomSplitter(valid_pct, seed=seed))
-    return cls.from_dblock(dblock, split_docs(flat, offsets), bs=bs, seq_len=seq_len)
+class TextDataLoadersNew(DataLoaders):
+    "Wrapper around several `DataLoader`s with factory methods for texts encoded by `HfTokenizer`"
+    @classmethod
+    @delegates(tokenize_dataset)
+    def from_dataset(cls, name, get_texts, subset=None, split='train', get_y=None, valid_pct=0.2, seed=None, seq_len=72, backwards=False, bs=64, **kwargs):
+        "`DataLoaders` from the token cache of a Hugging Face dataset: a language model, or a classifier when `get_y` gives the labels"
+        flat, offsets, tok = tokenize_dataset(name, get_texts, subset, split=split, **kwargs)
+        docs = split_docs(flat, offsets)
+        is_lm = get_y is None
+        blocks = [HfTextBlock(HfTokenizer(tok), is_lm=is_lm, seq_len=seq_len, backwards=backwards)]
+        if not is_lm:
+            ds = load_dataset(name, subset, split=split)
+            labels = ds[get_y] if isinstance(get_y, str) else get_y(ds)
+            if len(labels) != len(docs): raise ValueError(f'{len(labels)} labels for {len(docs)} documents: `get_texts` and `get_y` must give one item each per document')
+            blocks.append(CategoryBlock)
+        dblock = DataBlock(blocks=blocks,
+                           get_x=lambda i: docs[i],
+                           get_y=None if is_lm else (lambda i: labels[i]),
+                           splitter=RandomSplitter(valid_pct, seed=seed))
+        return cls.from_dblock(dblock, range_of(docs), bs=bs, seq_len=seq_len)
+
+    @classmethod
+    @delegates(DataLoaders.from_dblock)
+    def from_folder(cls, path, train='train', valid='valid', valid_pct=None, seed=None, is_lm=False, tok='gpt2', seq_len=72, backwards=False, folders=None, cache_dir=None, **kwargs):
+        "Create from imagenet style dataset in `path` with `train` and `valid` subfolders (or provide `valid_pct`)"
+        files, docs, tok = tokenize_folder(path, tok, cache_dir=cache_dir)
+        doc_of = dict(zip(files, docs))
+        blocks = [HfTextBlock(HfTokenizer(tok), is_lm=is_lm, seq_len=seq_len, backwards=backwards)]
+        if not is_lm: blocks.append(CategoryBlock)
+        if valid_pct is None: splitter,folders = GrandparentSplitter(train_name=train, valid_name=valid),ifnone(folders, [train, valid])
+        else: splitter = RandomSplitter(valid_pct, seed=seed)
+        dblock = DataBlock(blocks=blocks, get_x=doc_of.__getitem__, get_y=None if is_lm else parent_label, splitter=splitter)
+        return cls.from_dblock(dblock, get_text_files(path, folders=folders), path=path, seq_len=seq_len, **kwargs)
+
