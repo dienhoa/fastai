@@ -111,6 +111,7 @@ def tokenize_folder(
 # %% ../../nbs/36_text.tokenizer.ipynb #80b93f00
 class HfTokenizer(Transform):
     "Encode texts or cached token IDs with `tok`, adding `BOS_TOK` and `EOS_TOK`, and decode them back to text"
+    input_types = (str, np.ndarray)
     def __init__(self, tok):
         self.tok = tok
         self.bos,self.eos,self.pad_id = (tok.token_to_id(t) for t in (BOS_TOK, EOS_TOK, PAD_TOK))
