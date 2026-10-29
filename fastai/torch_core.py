@@ -14,10 +14,9 @@ __all__ = ['norm_types', 'setup_cuda', 'subplots', 'show_image', 'show_titled_im
            'TitledTuple', 'get_empty_df', 'display_df', 'get_first', 'one_param', 'item_find', 'find_device', 'find_bs',
            'np_func', 'Module', 'get_model', 'one_hot', 'one_hot_decode', 'params', 'trainable_params',
            'norm_bias_params', 'batch_to_samples', 'logit', 'num_distrib', 'rank_distrib', 'distrib_barrier',
-           'base_doc', 'doc', 'nested_reorder', 'flatten_check', 'make_cross_image', 'show_image_batch',
-           'requires_grad', 'init_default', 'cond_init', 'apply_leaf', 'apply_init', 'script_use_ctx',
-           'script_save_ctx', 'script_fwd', 'script_bwd', 'grad_module', 'ismin_torch', 'notmax_torch', 'progress_bar',
-           'master_bar']
+           'nested_reorder', 'flatten_check', 'make_cross_image', 'show_image_batch', 'requires_grad', 'init_default',
+           'cond_init', 'apply_leaf', 'apply_init', 'script_use_ctx', 'script_save_ctx', 'script_fwd', 'script_bwd',
+           'grad_module', 'ismin_torch', 'notmax_torch', 'progress_bar', 'master_bar', 'doc']
 
 # %% ../nbs/00_torch_core.ipynb #a5f202c7
 from .imports import *
@@ -760,20 +759,9 @@ def load_array(p:Path):
     "Save numpy array to a `pytables` file"
     with tables.open_file(p, 'r') as f: return f.root.data.read()
 
-# %% ../nbs/00_torch_core.ipynb #0b1e9072
-def base_doc(elt):
-    "Print a base documentation of `elt`"
-    name = getattr(elt, '__qualname__', getattr(elt, '__name__', ''))
-    print(f'{name}{inspect.signature(elt)}\n{inspect.getdoc(elt)}\n')
-    print('To get a prettier result with hyperlinks to source code and documentation, install nbdev: pip install nbdev')
-
 # %% ../nbs/00_torch_core.ipynb #3c35ba6c
-def doc(elt):
-    "Try to use doc form nbdev and fall back to `base_doc`"
-    try:
-        from nbdev.showdoc import doc
-        doc(elt)
-    except: base_doc(elt)
+from pyskills import doc
+_all_ = ['doc']
 
 # %% ../nbs/00_torch_core.ipynb #c2a57272
 def nested_reorder(t, idxs):
