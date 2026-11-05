@@ -6,8 +6,8 @@ Docs: https://docs.fast.ai/text.tokenizer.html.md"""
 
 # %% auto #0
 __all__ = ['EOS_TOK', 'BOS_TOK', 'PAD_TOK', 'hf_tokenizer', 'save_token_cache', 'load_token_cache', 'id_dtype', 'tokenize_texts',
-           'split_docs', 'tokenize_dataset', 'tokenize_folder', 'HfTokenizer', 'Reverse', 'HfTextBlock',
-           'TextDataLoadersNew']
+           'split_docs', 'get_dataset_data', 'tokenize_dataset', 'get_folder_data', 'tokenize_folder', 'HfTokenizer',
+           'Reverse', 'HfTextBlock', 'get_metadata_splits', 'TextDataLoadersNew']
 
 # %% ../../nbs/36_text.tokenizer.ipynb #1f30303f
 from ..torch_basics import *
@@ -28,18 +28,23 @@ def hf_tokenizer(name='gpt2'):
     return tok
 
 # %% ../../nbs/36_text.tokenizer.ipynb #b4c209c8
-def save_token_cache(path, flat, offsets, tok):
-    "Save token IDs, document offsets and their tokenizer to directory `path`"
+def save_token_cache(path, flat, offsets, tok, metadata):
+    "Save token IDs, offsets, tokenizer and document metadata to `path`"
+    if len(metadata) != len(offsets)-1: raise ValueError('metadata rows must match the number of documents')
     path = Path(path)
     path.mkdir(parents=True, exist_ok=True)
     np.save(path/'flat.npy', flat)
     np.save(path/'offsets.npy', offsets)
+    metadata.to_csv(path/'metadata.csv', index=False)
     tok.save(str(path/'tokenizer.json'))
 
 def load_token_cache(path):
-    "Load token IDs, document offsets and their tokenizer from directory `path`"
+    "Load token IDs, offsets, tokenizer and document metadata from `path`"
     path = Path(path)
-    return np.load(path/'flat.npy'), np.load(path/'offsets.npy'), Tokenizer.from_file(str(path/'tokenizer.json'))
+    flat, offsets = np.load(path/'flat.npy'), np.load(path/'offsets.npy')
+    tok = Tokenizer.from_file(str(path/'tokenizer.json'))
+    metadata = pd.read_csv(path/'metadata.csv', dtype=str)
+    return flat, offsets, tok, metadata
 
 # %% ../../nbs/36_text.tokenizer.ipynb #e6828c02
 def id_dtype(tok):
@@ -52,7 +57,6 @@ def tokenize_texts(
     tok, # HF `Tokenizer`
     get_texts=None, # Column of texts from Dataset, or function from `items` to the texts
     bs=1024, 
-    cache_dir=None,
 ):
     "Encode texts into flat token IDs and document offsets, where document `i` is `flat[offsets[i]:offsets[i+1]]`"
     if isinstance(get_texts, str): get_texts = itemgetter(get_texts)
@@ -62,7 +66,6 @@ def tokenize_texts(
     chunks = [np.asarray(e.ids, dtype=dtype) for i in progress_bar(range(0, len(texts), bs)) for e in tok.encode_batch_fast(texts[i:i+bs])]
     flat = np.concatenate(chunks) if chunks else np.empty(0, dtype=dtype)
     offsets = np.cumsum([0] + [len(c) for c in chunks], dtype=np.int64)
-    if cache_dir is not None: save_token_cache(cache_dir, flat, offsets, tok)
     return flat, offsets
 
 # %% ../../nbs/36_text.tokenizer.ipynb #10c6f2c0
@@ -70,43 +73,99 @@ def split_docs(flat, offsets):
     "The documents of a token cache, as views into `flat`"
     return L(flat[i:j] for i,j in zip(offsets[:-1], offsets[1:]))
 
-# %% ../../nbs/36_text.tokenizer.ipynb #28842e1f
-@delegates(tokenize_texts)
-def tokenize_dataset(
-    name, # Hugging Face dataset
-    get_texts, # Column of the dataset, or function from it to its texts
+# %% ../../nbs/36_text.tokenizer.ipynb #6d97eaf8
+def get_dataset_data(
+    name, # Hugging Face Hub dataset name or local dataset directory
+    get_data=None, # Optional callable returning (texts, metadata DataFrame) for each split
     subset=None,
-    split='train',
+    split=None, # All splits if None, or a split name/expression or list of splits
+    text_col=None, # Text column; required when get_data is not supplied
+    metadata_cols=(), # Columns to cache alongside the source split
+):
+    "Load selected dataset splits and combine their prepared texts and metadata"
+    if get_data is None and text_col is None: raise ValueError('Provide text_col or get_data')
+    dsets = load_dataset(name, subset, split=split)
+    if split is None: dsets = dsets.values()
+    elif isinstance(split, str): dsets = [dsets]
+    texts, metadata = [], []
+    for ds in dsets:
+        if get_data is None:
+            split_texts = ds[text_col]
+            split_metadata = pd.DataFrame({c: ds[c] for c in metadata_cols}, index=range(len(ds)))
+            split_metadata['split'] = str(ds.split)
+        else: split_texts, split_metadata = get_data(ds)
+        texts.extend(split_texts)
+        metadata.append(split_metadata)
+    return texts, pd.concat(metadata, ignore_index=True)
+
+# %% ../../nbs/36_text.tokenizer.ipynb #28842e1f
+@delegates(get_dataset_data)
+def tokenize_dataset(
+    name, # Hugging Face Hub dataset name or local dataset directory
+    subset=None,
+    split=None, # All splits if None, or a split name/expression or list of splits
     tok='gpt2', # Tokenizer name for `hf_tokenizer`
-    cache_dir=None, # Cache directory; `fastai_path('data')/'token_cache'/name/subset/split/tok` if None
+    cache_dir=None, # Cache directory; defaults to a path keyed by source, selected splits and tokenizer
+    bs=1024, # Texts per tokenizer batch
     **kwargs
 ):
-    "Token cache for a Hugging Face dataset, loaded from `cache_dir` when it exists, otherwise encoded and saved there first"
-    if cache_dir is None: cache_dir = fastai_path('data')/'token_cache'/name/(subset or 'default')/split/tok
-    if not (Path(cache_dir)/'tokenizer.json').exists():
-        ds = load_dataset(name, subset, split=split)
-        tokenize_texts(ds, hf_tokenizer(tok), get_texts=get_texts, cache_dir=cache_dir, **kwargs)
+    "Build or load a token cache for a Hugging Face Hub dataset or local dataset directory"
+    split_key = 'all' if split is None else str(split)
+    if cache_dir is None: cache_dir = fastai_path('data')/'token_cache'/name/(subset or 'default')/split_key/tok
+    if not (Path(cache_dir)/'metadata.csv').exists():
+        texts, metadata = get_dataset_data(name, subset=subset, split=split, **kwargs)
+        tok = hf_tokenizer(tok)
+        flat, offsets = tokenize_texts(texts, tok, bs=bs)
+        save_token_cache(cache_dir, flat, offsets, tok, metadata)
     return load_token_cache(cache_dir)
 
 
+# %% ../../nbs/36_text.tokenizer.ipynb #18238162
+def get_folder_data(
+    path, # Folder of text files
+    get_metadata=None # Callable returning metadata columns for nonstandard folder layouts
+):
+    "List sorted text files under `path` and prepare their metadata"
+    path = Path(path)
+    files = get_text_files(path).sorted()
+    rel_files = [f.relative_to(path) for f in files]
+    paths = [str(f) for f in rel_files]
+    if get_metadata is None:
+        metadata = pd.DataFrame(dict(
+            path=paths,
+            label=[f.parent.name if len(f.parts) >= 2 else None for f in rel_files],
+            split=[f.parents[1].name if len(f.parts) >= 3 else None for f in rel_files]))
+    else:
+        metadata = get_metadata(rel_files)
+        if len(metadata) != len(files): raise ValueError('get_metadata must return one row per file')
+        metadata = pd.concat([pd.DataFrame(dict(path=paths)), metadata.reset_index(drop=True)], axis=1)
+    return files, metadata
+
 # %% ../../nbs/36_text.tokenizer.ipynb #53a42456
-@delegates(tokenize_texts)
+@delegates(tokenize_texts, but=['get_texts'])
 def tokenize_folder(
     path, # Folder of text files
     tok='gpt2', # Tokenizer name for `hf_tokenizer`
+    get_metadata=None, # Callable returning metadata columns for nonstandard folder layouts
     cache_dir=None, # Cache directory; `fastai_path('data')/'token_cache'/path.name/tok` if None
     **kwargs
 ):
-    "Every text file under `path`, their token cache, and its tokenizer; the cache is built on the first call"
+    "Cache text files under `path` with paths and metadata"
     path = Path(path)
-    files = get_text_files(path).sorted()
+    files, metadata = get_folder_data(path, get_metadata)
     if cache_dir is None: cache_dir = fastai_path('data')/'token_cache'/path.name/tok
-    if not (Path(cache_dir)/'tokenizer.json').exists():
-        tokenize_texts(files, hf_tokenizer(tok), get_texts=lambda fs: [f.read_text(encoding='utf-8') for f in fs], cache_dir=cache_dir, **kwargs)
-    flat, offsets, tok = load_token_cache(cache_dir)
-    docs = split_docs(flat, offsets)
-    if len(docs) != len(files): raise ValueError(f'{cache_dir} holds {len(docs)} documents for {len(files)} files: delete it to rebuild')
-    return files, docs, tok
+    cache_meta = Path(cache_dir)/'metadata.csv'
+    if cache_meta.exists():
+        flat, offsets, tokenizer, cached_metadata = load_token_cache(cache_dir)
+        if 'path' in cached_metadata and metadata['path'].tolist() == cached_metadata['path'].tolist():
+            docs = split_docs(flat, offsets)
+            if len(docs) != len(files): raise ValueError(f'{cache_dir} holds {len(docs)} documents for {len(files)} files: delete it to rebuild')
+            return files, docs, tokenizer, cached_metadata
+    tokenizer = hf_tokenizer(tok)
+    flat, offsets = tokenize_texts(files, tokenizer,
+        get_texts=lambda fs: [f.read_text(encoding='utf-8') for f in fs], **kwargs)
+    save_token_cache(cache_dir, flat, offsets, tokenizer, metadata)
+    return files, split_docs(flat, offsets), tokenizer, pd.read_csv(cache_meta, dtype=str)
 
 # %% ../../nbs/36_text.tokenizer.ipynb #80b93f00
 class HfTokenizer(Transform):
@@ -120,6 +179,7 @@ class HfTokenizer(Transform):
     def _len(self, o): return len(o) if isinstance(o, np.ndarray) else len(self.tok.encode(o).ids)
     def get_lengths(self, items):
         items = L(items)
+        if not items: return L()
         return L(self._len(o)+2 for o in items) if isinstance(items[0], (np.ndarray, str)) else None
     def encodes(self, s:str): return self._add_boundaries(self.tok.encode(s).ids)
     def encodes(self, s:np.ndarray): return self._add_boundaries(s.tolist())
@@ -139,38 +199,83 @@ class HfTextBlock(TransformBlock):
         super().__init__(type_tfms=type_tfms, dl_type=LMDataLoader if is_lm else SortedDL,
                          dls_kwargs={'seq_len': seq_len} if is_lm else {'before_batch': Pad_Chunk(seq_len=seq_len, pad_idx=tok_tfm.pad_id)})
 
+# %% ../../nbs/36_text.tokenizer.ipynb #cb7e9f3d
+def get_metadata_splits(
+    metadata, # One metadata row per cached document
+    train='train', # Training split name
+    valid='validation', # Validation split name
+    valid_pct=None, # Random validation fraction; None uses named source splits
+    seed=None, # Random split seed
+    folders=None # Top-level source folders to include; valid_pct splits all their rows
+):
+    "Training and validation row positions from cached metadata"
+    rows = L(range_of(metadata))
+    if folders is not None:
+        folders = L(folders)
+        rows = L(mask2idxs(metadata['path'].map(lambda p: Path(p).parts[0] in folders)))
+        metadata = metadata.iloc[rows]
+    if valid_pct is not None:
+        train_idx, valid_idx = RandomSplitter(valid_pct, seed=seed)(rows)
+        return rows[train_idx], rows[valid_idx]
+    return [rows[mask2idxs(metadata['split'] == name)] for name in (train, valid)]
+
 # %% ../../nbs/36_text.tokenizer.ipynb #e105258d
 class TextDataLoadersNew(DataLoaders):
     "Wrapper around several `DataLoader`s with factory methods for texts encoded by `HfTokenizer`"
     @classmethod
     @delegates(tokenize_dataset)
-    def from_dataset(cls, name, get_texts, subset=None, split='train', get_y=None, valid_pct=0.2, seed=None, seq_len=72, backwards=False, bs=64, **kwargs):
-        "`DataLoaders` from the token cache of a Hugging Face dataset: a language model, or a classifier when `get_y` gives the labels"
-        flat, offsets, tok = tokenize_dataset(name, get_texts, subset, split=split, **kwargs)
+    def from_dataset(
+        cls,
+        name, # Hub dataset name or local dataset directory
+        get_y=None, # Label column in cached metadata; None for a language model
+        train='train', # Source split used for training
+        valid='validation', # Source split used for validation
+        valid_pct=None, # Random validation fraction of selected rows; None uses source splits
+        metadata_cols=(), # Additional source columns to cache; get_y is included automatically
+        seed=None, # Random split seed
+        seq_len=72, # Language model sequence length or classifier padding chunk size
+        backwards=False, # Reverse each tokenized document
+        bs=64, # DataLoader batch size
+        **kwargs
+    ):
+        "Build language model or classification loaders using cached document metadata"
+        metadata_cols = (L(metadata_cols) + L(get_y)).unique()
+        if valid_pct is None: kwargs.setdefault('split', [train, valid])
+        flat, offsets, tok, metadata = tokenize_dataset(name, metadata_cols=metadata_cols, **kwargs)
         docs = split_docs(flat, offsets)
+        splits = get_metadata_splits(metadata, train=train, valid=valid, valid_pct=valid_pct, seed=seed)
         is_lm = get_y is None
         blocks = [HfTextBlock(HfTokenizer(tok), is_lm=is_lm, seq_len=seq_len, backwards=backwards)]
-        if not is_lm:
-            ds = load_dataset(name, subset, split=split)
-            labels = ds[get_y] if isinstance(get_y, str) else get_y(ds)
-            if len(labels) != len(docs): raise ValueError(f'{len(labels)} labels for {len(docs)} documents: `get_texts` and `get_y` must give one item each per document')
-            blocks.append(CategoryBlock)
-        dblock = DataBlock(blocks=blocks,
-                           get_x=lambda i: docs[i],
-                           get_y=None if is_lm else (lambda i: labels[i]),
-                           splitter=RandomSplitter(valid_pct, seed=seed))
+        if not is_lm: blocks.append(CategoryBlock)
+        dblock = DataBlock(blocks=blocks, get_x=lambda i: docs[i],
+            get_y=None if is_lm else (lambda i: metadata[get_y].iloc[i]), splitter=lambda _: splits)
         return cls.from_dblock(dblock, range_of(docs), bs=bs, seq_len=seq_len)
 
     @classmethod
     @delegates(DataLoaders.from_dblock)
-    def from_folder(cls, path, train='train', valid='valid', valid_pct=None, seed=None, is_lm=False, tok='gpt2', seq_len=72, backwards=False, folders=None, cache_dir=None, **kwargs):
-        "Create from imagenet style dataset in `path` with `train` and `valid` subfolders (or provide `valid_pct`)"
-        files, docs, tok = tokenize_folder(path, tok, cache_dir=cache_dir)
-        doc_of = dict(zip(files, docs))
+    def from_folder(
+        cls,
+        path, # Folder of text files
+        train='train', # Training split name in cached metadata
+        valid='valid', # Validation split name in cached metadata
+        valid_pct=None, # Random validation fraction; None uses source splits
+        seed=None, # Random split seed
+        is_lm=False, # Build a language model instead of a classifier
+        tok='gpt2', # Tokenizer name for hf_tokenizer
+        seq_len=72, # Language model sequence length or classifier padding chunk size
+        backwards=False, # Reverse each tokenized document
+        folders=None, # Source folders to include; with valid_pct, combine their rows before splitting
+        cache_dir=None, # Token cache directory
+        get_y='label', # Cached label column for classification
+        get_metadata=None, # Callable returning metadata columns for nonstandard folder layouts
+        **kwargs
+    ):
+        "Build language model or classification loaders from a folder's cached metadata"
+        _, docs, tok, metadata = tokenize_folder(path, tok, get_metadata=get_metadata, cache_dir=cache_dir)
+        splits = get_metadata_splits(metadata, train=train, valid=valid, valid_pct=valid_pct, seed=seed, folders=folders)
         blocks = [HfTextBlock(HfTokenizer(tok), is_lm=is_lm, seq_len=seq_len, backwards=backwards)]
         if not is_lm: blocks.append(CategoryBlock)
-        if valid_pct is None: splitter,folders = GrandparentSplitter(train_name=train, valid_name=valid),ifnone(folders, [train, valid])
-        else: splitter = RandomSplitter(valid_pct, seed=seed)
-        dblock = DataBlock(blocks=blocks, get_x=doc_of.__getitem__, get_y=None if is_lm else parent_label, splitter=splitter)
-        return cls.from_dblock(dblock, get_text_files(path, folders=folders), path=path, seq_len=seq_len, **kwargs)
+        dblock = DataBlock(blocks=blocks, get_x=lambda i: docs[i],
+            get_y=None if is_lm else (lambda i: metadata[get_y].iloc[i]), splitter=lambda _: splits)
+        return cls.from_dblock(dblock, range_of(docs), path=path, seq_len=seq_len, **kwargs)
 
