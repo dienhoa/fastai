@@ -255,15 +255,14 @@ class TextDataLoadersNew(DataLoaders):
         label_col=None, # Label column in cached metadata; None for a language model
         metadata_cols=(), # Additional source columns to cache; label_col is included automatically
         subset=None, # Dataset configuration name
-        source_split=None, # Source split(s); None selects train/valid, or all with valid_pct
         text_col=None, # Text column; required when get_data is not supplied
         get_data=None, # Callable returning texts and metadata for each source split
         **kwargs
     ):
         "Build language model or classification loaders using cached document metadata"
         metadata_cols = (L(metadata_cols) + L(label_col)).unique()
-        if source_split is None and valid_pct is None: source_split = [train, valid]
-        flat, offsets, tok, metadata = tokenize_dataset(name, subset=subset, split=source_split, tok=tok,
+        split = [train, valid] if valid_pct is None else None
+        flat, offsets, tok, metadata = tokenize_dataset(name, subset=subset, split=split, tok=tok,
             cache_dir=cache_dir, text_col=text_col, get_data=get_data, metadata_cols=metadata_cols)
         docs = split_docs(flat, offsets)
         splits = get_metadata_splits(metadata, train=train, valid=valid, valid_pct=valid_pct, seed=seed)
