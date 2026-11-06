@@ -229,6 +229,7 @@ class TextDataLoadersNew(DataLoaders):
         labels=None, # One label per document; None for a language model
         seq_len=72, # Language model sequence length or classifier padding chunk size
         backwards=False, # Reverse each tokenized document
+        bs=64, # DataLoader batch size
         **kwargs
     ):
         r"Build language model or classification loaders from tokenized documents"
@@ -238,32 +239,36 @@ class TextDataLoadersNew(DataLoaders):
         items = docs if is_lm else L(zip(docs, labels))
         getters = None if is_lm else [ItemGetter(0), ItemGetter(1)]
         dblock = DataBlock(blocks=blocks, getters=getters, splitter=lambda _: splits)
-        return cls.from_dblock(dblock, items, seq_len=seq_len, **kwargs)
+        return cls.from_dblock(dblock, items, seq_len=seq_len, bs=bs, **kwargs)
 
     @classmethod
-    @delegates(tokenize_dataset)
+    @delegates(from_docs, but=['labels'])
     def from_dataset(
         cls,
         name, # Hub dataset name or local dataset directory
-        label_col=None, # Label column in cached metadata; None for a language model
         train='train', # Source split used for training
         valid='validation', # Source split used for validation
         valid_pct=None, # Random validation fraction of selected rows; None uses source splits
-        metadata_cols=(), # Additional source columns to cache; label_col is included automatically
         seed=None, # Random split seed
-        seq_len=72, # Language model sequence length or classifier padding chunk size
-        backwards=False, # Reverse each tokenized document
-        bs=64, # DataLoader batch size
+        tok='gpt2', # Tokenizer name for hf_tokenizer
+        cache_dir=None, # Token cache directory
+        label_col=None, # Label column in cached metadata; None for a language model
+        metadata_cols=(), # Additional source columns to cache; label_col is included automatically
+        subset=None, # Dataset configuration name
+        source_split=None, # Source split(s); None selects train/valid, or all with valid_pct
+        text_col=None, # Text column; required when get_data is not supplied
+        get_data=None, # Callable returning texts and metadata for each source split
         **kwargs
     ):
         "Build language model or classification loaders using cached document metadata"
         metadata_cols = (L(metadata_cols) + L(label_col)).unique()
-        if valid_pct is None: kwargs.setdefault('split', [train, valid])
-        flat, offsets, tok, metadata = tokenize_dataset(name, metadata_cols=metadata_cols, **kwargs)
+        if source_split is None and valid_pct is None: source_split = [train, valid]
+        flat, offsets, tok, metadata = tokenize_dataset(name, subset=subset, split=source_split, tok=tok,
+            cache_dir=cache_dir, text_col=text_col, get_data=get_data, metadata_cols=metadata_cols)
         docs = split_docs(flat, offsets)
         splits = get_metadata_splits(metadata, train=train, valid=valid, valid_pct=valid_pct, seed=seed)
         labels = None if label_col is None else metadata[label_col]
-        return cls.from_docs(docs, tok, splits, labels=labels, seq_len=seq_len, backwards=backwards, bs=bs)
+        return cls.from_docs(docs, tok, splits, labels=labels, **kwargs)
 
     @classmethod
     @delegates(from_docs, but=['labels'])
@@ -276,8 +281,6 @@ class TextDataLoadersNew(DataLoaders):
         seed=None, # Random split seed
         is_lm=False, # Build a language model instead of a classifier
         tok='gpt2', # Tokenizer name for hf_tokenizer
-        seq_len=72, # Language model sequence length or classifier padding chunk size
-        backwards=False, # Reverse each tokenized document
         folders=None, # Source folders to include; with valid_pct, combine their rows before splitting
         cache_dir=None, # Token cache directory
         label_col='label', # Cached label column for classification
@@ -288,5 +291,5 @@ class TextDataLoadersNew(DataLoaders):
         _, docs, tok, metadata = tokenize_folder(path, tok, get_metadata=get_metadata, cache_dir=cache_dir)
         splits = get_metadata_splits(metadata, train=train, valid=valid, valid_pct=valid_pct, seed=seed, folders=folders)
         labels = None if is_lm else metadata[label_col]
-        return cls.from_docs(docs, tok, splits, labels=labels, path=path, seq_len=seq_len, backwards=backwards, **kwargs)
+        return cls.from_docs(docs, tok, splits, labels=labels, path=path, **kwargs)
 
