@@ -4,7 +4,7 @@
 
 # %% auto #0
 __all__ = ['EOS_TOK', 'BOS_TOK', 'PAD_TOK', 'hf_tokenizer', 'save_token_cache', 'load_token_cache', 'id_dtype', 'tokenize_texts',
-           'split_docs', 'get_dataset_data', 'tokenize_dataset', 'get_folder_data', 'tokenize_folder', 'HfTokenizer',
+           'TokenDocs', 'get_dataset_data', 'tokenize_dataset', 'get_folder_data', 'tokenize_folder', 'HfTokenizer',
            'Reverse', 'HfTextBlock', 'get_metadata_splits', 'TextDataLoadersNew']
 
 # %% ../../nbs/36_text.tokenizer.ipynb #1f30303f
@@ -67,8 +67,26 @@ def tokenize_texts(
     return flat, offsets
 
 # %% ../../nbs/36_text.tokenizer.ipynb #10c6f2c0
-def split_docs(flat, offsets):
-    return L(flat[i:j] for i,j in zip(offsets[:-1], offsets[1:]))
+class TokenDocs:
+    "Document views backed by flat token IDs and offsets"
+    def __init__(
+        self,
+        flat, # Concatenated token IDs
+        offsets, # Document boundaries in flat
+        idxs=None # Document indices for a subset; None includes every document
+    ):
+        self.flat,self.offsets = flat,offsets
+        self.idxs = np.arange(len(offsets)-1) if idxs is None else idxs
+
+    def __len__(self): return len(self.idxs)
+    def __repr__(self): return f'TokenDocs({len(self)} documents)'
+    @property
+    def iloc(self): return self
+
+    def __getitem__(self, i):
+        i = self.idxs[i]
+        if not is_indexer(i): return type(self)(self.flat, self.offsets, i)
+        return self.flat[self.offsets[i]:self.offsets[i+1]]
 
 # %% ../../nbs/36_text.tokenizer.ipynb #6d97eaf8
 def get_dataset_data(
@@ -155,14 +173,14 @@ def tokenize_folder(
     if cache_meta.exists():
         flat, offsets, tokenizer, cached_metadata = load_token_cache(cache_dir)
         if 'path' in cached_metadata and metadata['path'].tolist() == cached_metadata['path'].tolist():
-            docs = split_docs(flat, offsets)
+            docs = TokenDocs(flat, offsets)
             if len(docs) != len(files): raise ValueError(f'{cache_dir} holds {len(docs)} documents for {len(files)} files: delete it to rebuild')
             return files, docs, tokenizer, cached_metadata
     tokenizer = hf_tokenizer(tok)
     flat, offsets = tokenize_texts(files, tokenizer,
         get_texts=lambda fs: [f.read_text(encoding='utf-8') for f in fs], **kwargs)
     save_token_cache(cache_dir, flat, offsets, tokenizer, metadata)
-    return files, split_docs(flat, offsets), tokenizer, pd.read_csv(cache_meta, dtype=str)
+    return files, TokenDocs(flat, offsets), tokenizer, pd.read_csv(cache_meta, dtype=str)
 
 # %% ../../nbs/36_text.tokenizer.ipynb #80b93f00
 class HfTokenizer(Transform):
@@ -175,6 +193,7 @@ class HfTokenizer(Transform):
     def _add_boundaries(self, ids): return TensorText([self.bos] + ids + [self.eos])
     def _len(self, o): return len(o) if isinstance(o, np.ndarray) else len(self.tok.encode(o).ids)
     def get_lengths(self, items):
+        if isinstance(items, TokenDocs): return (np.diff(items.offsets)+2)[items.idxs]
         items = L(items)
         if not items: return L()
         return L(self._len(o)+2 for o in items) if isinstance(items[0], (np.ndarray, str)) else None
@@ -220,10 +239,10 @@ def get_metadata_splits(
 class TextDataLoadersNew(DataLoaders):
     "Wrapper around several `DataLoader`s with factory methods for texts encoded by `HfTokenizer`"
     @classmethod
-    @delegates(DataLoaders.from_dblock)
+    @delegates(Datasets.dataloaders)
     def from_docs(
         cls,
-        docs, # Token ID arrays, one per document
+        docs, # TokenDocs backed by flat token IDs and offsets
         tok, # Tokenizer used to encode the documents
         splits, # Training and validation document indices
         labels=None, # One label per document; None for a language model
@@ -234,12 +253,12 @@ class TextDataLoadersNew(DataLoaders):
     ):
         r"Build language model or classification loaders from tokenized documents"
         is_lm = labels is None
-        blocks = [HfTextBlock(HfTokenizer(tok), is_lm=is_lm, seq_len=seq_len, backwards=backwards)]
-        if not is_lm: blocks.append(CategoryBlock)
-        items = docs if is_lm else L(zip(docs, labels))
-        getters = None if is_lm else [ItemGetter(0), ItemGetter(1)]
-        dblock = DataBlock(blocks=blocks, getters=getters, splitter=lambda _: splits)
-        return cls.from_dblock(dblock, items, seq_len=seq_len, bs=bs, **kwargs)
+        text = HfTextBlock(HfTokenizer(tok), is_lm=is_lm, seq_len=seq_len, backwards=backwards)
+        tls = [TfmdLists(docs, text.type_tfms, splits=splits)]
+        if not is_lm: tls.append(TfmdLists(labels, CategoryBlock().type_tfms, splits=splits))
+        dsets = Datasets(tls=tls, dl_type=text.dl_type)
+        kwargs = {**text.dls_kwargs, 'after_item': text.item_tfms, 'after_batch': text.batch_tfms, **kwargs}
+        return dsets.dataloaders(bs=bs, **kwargs)
 
     @classmethod
     @delegates(from_docs, but=['labels'])
@@ -264,7 +283,7 @@ class TextDataLoadersNew(DataLoaders):
         split = [train, valid] if valid_pct is None else None
         flat, offsets, tok, metadata = tokenize_dataset(name, subset=subset, split=split, tok=tok,
             cache_dir=cache_dir, text_col=text_col, get_data=get_data, metadata_cols=metadata_cols)
-        docs = split_docs(flat, offsets)
+        docs = TokenDocs(flat, offsets)
         splits = get_metadata_splits(metadata, train=train, valid=valid, valid_pct=valid_pct, seed=seed)
         labels = None if label_col is None else metadata[label_col]
         return cls.from_docs(docs, tok, splits, labels=labels, **kwargs)
